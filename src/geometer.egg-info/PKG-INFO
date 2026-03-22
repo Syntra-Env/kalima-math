@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: geometer
+Version: 0.1.0
+Summary: Syntra Geometer: Mathematical Foundation for Quranic Research
+Requires-Python: >=3.11
+Requires-Dist: numpy
+Requires-Dist: scipy

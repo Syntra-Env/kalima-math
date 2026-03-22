@@ -1,32 +1,33 @@
-"""Root Space: Distributional vector representation of Arabic roots.
+"""
+Root Space: PRISM-Native Distributional Analysis of Arabic Roots.
 
-A root is NOT a scalar. It is characterized by its full usage pattern
-across the entire Quran:
+This module extends PRISM to represent Arabic roots as triadic coordinates
+and computes similarity using PRISM's correlation engine.
 
+A root is characterized by its full usage pattern across the Quran:
   - Which POS forms it takes (verb, noun, adjective, etc.)
   - Which morphological patterns (awzan) it participates in
-  - Which grammatical features it manifests (person, number, gender, case)
+  - Which grammatical features it manifests
   - How many verses it appears in and how spread out they are
-  - What other roots co-occur with it in the same verses
 
-This gives each root a high-dimensional fingerprint. Two roots are
-"close" if they behave similarly across the Quran — not if their
-hashes are similar, and not if they're both rare.
+Each root's distributional profile is encoded as a PRISM coordinate.
+Two roots are "close" if their PRISM coordinates correlate.
 
-Key concepts:
-  - distributional_weight: how central a root is (frequent, spread across
-    many surahs = structural pillar). Opposite of surprisal.
-  - anomaly_score: how unusual a SPECIFIC INSTANCE is relative to the
-    root's typical behavior. This is what surprisal was trying to be.
-  - concordance_distance: similarity between two roots based on their
-    distributional overlap.
+Key concepts (now PRISM-native):
+  - prism_coordinate: PRISM triadic address for this root's profile
+  - distributional_weight: derived from stratum (total information content)
+  - anomaly_score: PRISM fidelity deviation from root's typical behavior
+  - concordance_distance: PRISM correlation between root coordinates
 """
 
-import numpy as np
 from dataclasses import dataclass, field
+from typing import Optional
+
+from .prism import UOR, Triad
+from .uor import Q256
 
 
-# ── Feature vocabulary (fixed order for vector dimensions) ──
+# ── Feature vocabulary (fixed order for profile encoding) ──
 
 POS_KEYS = [
     "N", "V", "ADJ", "DET", "CONJ", "P", "PRON", "PN",
@@ -50,7 +51,7 @@ NUMBER_KEYS = ["S", "D", "P"]
 GENDER_KEYS = ["M", "F"]
 CASE_KEYS = ["NOM", "ACC", "GEN"]
 
-# Index maps for fast lookup
+# Index maps
 _POS_IDX = {k: i for i, k in enumerate(POS_KEYS)}
 _VF_IDX = {k: i for i, k in enumerate(VERB_FORM_KEYS)}
 _ASP_IDX = {k: i for i, k in enumerate(ASPECT_KEYS)}
@@ -59,7 +60,7 @@ _NUM_IDX = {k: i for i, k in enumerate(NUMBER_KEYS)}
 _GEN_IDX = {k: i for i, k in enumerate(GENDER_KEYS)}
 _CAS_IDX = {k: i for i, k in enumerate(CASE_KEYS)}
 
-# Total vector dimensions
+# Dimensions
 POS_DIM = len(POS_KEYS)
 VF_DIM = len(VERB_FORM_KEYS)
 ASP_DIM = len(ASPECT_KEYS)
@@ -70,95 +71,167 @@ CAS_DIM = len(CASE_KEYS)
 
 PROFILE_DIM = POS_DIM + VF_DIM + ASP_DIM + PER_DIM + NUM_DIM + GEN_DIM + CAS_DIM
 
-
-from .gauge import analyze_resonance, ResonanceAnalysis
+# Quran bounds
+MAX_SURAHS = 114
+MAX_VERSES = 6236
 
 
 @dataclass
 class RootVector:
     """Distributional vector for a single Arabic root.
-
+    
     Built from ALL instances of this root across the Quran.
+    Now with PRISM-native coordinate representation.
     """
     root_id: int
     lookup_key: str           # e.g. "سجد"
-    label_ar: str | None
+    label_ar: Optional[str]
 
     # Raw counts
-    total_instances: int = 0  # total word occurrences
-    total_verses: int = 0     # distinct verses
-    total_surahs: int = 0     # distinct surahs
-    total_morpheme_types: int = 0  # distinct morpheme forms
-    total_lemmas: int = 0     # distinct lemmas
+    total_instances: int = 0
+    total_verses: int = 0
+    total_surahs: int = 0
+    total_morpheme_types: int = 0
+    total_lemmas: int = 0
 
-    # Distributional profile: normalized frequency of each feature value
-    # across all morpheme types of this root.
-    # Shape: (PROFILE_DIM,) — concatenation of POS + VF + ASP + PER + NUM + GEN + CAS
-    profile: np.ndarray = field(default_factory=lambda: np.zeros(PROFILE_DIM))
+    # Profile as list (encoded to PRISM coordinate)
+    profile: list[float] = field(default_factory=lambda: [0.0] * PROFILE_DIM)
 
-    # Co-occurrence fingerprint: {other_root_id: count_of_shared_verses}
+    # Co-occurrence fingerprint
     cooccurrence_counts: dict[int, int] = field(default_factory=dict)
 
-    # Surah spread: which surahs this root appears in (set of ints)
-    surah_set: set[int] = field(default_factory=set)
+    # Surah spread
+    surah_set: set = field(default_factory=set)
 
-    # Verse locations: list of (surah, ayah) tuples
-    verse_locations: list[tuple[int, int]] = field(default_factory=list)
+    # Verse locations
+    verse_locations: list = field(default_factory=list)
+
+    # ── PRISM Integration ──────────────────────────────────────────
+
+    @property
+    def prism_triplet(self) -> Triad:
+        """PRISM triadic coordinate derived from profile.
+        
+        Encodes the distributional profile as a byte sequence,
+        then maps to PRISM coordinates (datum, stratum, spectrum).
+        """
+        triplet = _profile_to_prism_triplet(self.profile)
+        return triplet
+
+    @property
+    def prism_coordinate(self) -> tuple:
+        """PRISM datum (byte tuple) for this root's profile."""
+        return Q256._to_bytes(_profile_to_int(self.profile))
+
+    @property
+    def prism_derivation_id(self) -> str:
+        """Content-addressed derivation ID for this root's profile."""
+        coord = self.prism_coordinate
+        return Q256._iri(coord)
 
     @property
     def distributional_weight(self) -> float:
         """How central is this root in the Quran?
-
-        High = structural pillar (appears in many surahs, many forms).
-        Low = peripheral or specialized.
-
-        Uses surah spread * morphological diversity, not raw frequency.
-        A root in 50 surahs with 10 forms is more central than one
-        in 2 surahs with 100 instances of the same form.
+        
+        Derived from PRISM stratum: higher stratum = more information = more central.
         """
         if self.total_instances == 0:
             return 0.0
-        surah_spread = self.total_surahs / 114.0
+        # Stratum-based: higher popcount = more diverse = more central
+        triad = self.prism_triplet
+        stratum_normalized = triad.total_stratum / (PROFILE_DIM * 8)
+        surah_spread = self.total_surahs / MAX_SURAHS
         form_diversity = min(self.total_morpheme_types / 20.0, 1.0)
-        return surah_spread * 0.6 + form_diversity * 0.4
+        return (stratum_normalized * 0.3 + surah_spread * 0.5 + form_diversity * 0.2)
 
     @property
-    def pos_distribution(self) -> np.ndarray:
-        """POS slice of the profile vector."""
-        return self.profile[:POS_DIM]
+    def information_content(self) -> float:
+        """PRISM stratum as information content (bits)."""
+        return float(self.prism_triplet.total_stratum)
 
     @property
-    def verb_form_distribution(self) -> np.ndarray:
-        """Verb form slice."""
-        start = POS_DIM
-        return self.profile[start:start + VF_DIM]
+    def profile_bytes(self) -> bytes:
+        """Profile encoded as bytes for PRISM coordinate."""
+        return _profile_to_bytes(self.profile)
+
+
+@dataclass  
+class InstanceVector:
+    """A single usage instance of a root, with PRISM coordinates."""
+    root: RootVector
+    location: tuple  # (surah, ayah)
+    features: dict
 
     @property
-    def aspect_distribution(self) -> np.ndarray:
-        """Aspect slice."""
-        start = POS_DIM + VF_DIM
-        return self.profile[start:start + ASP_DIM]
+    def prism_coordinate(self) -> tuple:
+        """Instance-specific PRISM coordinate."""
+        return Q256._to_bytes(_features_to_int(self.features))
+
+    @property
+    def anomaly_score(self) -> float:
+        """PRISM fidelity deviation from root's typical behavior.
+        
+        Uses PRISM correlation between instance and root coordinates.
+        """
+        root_coord = self.root.prism_coordinate
+        instance_coord = self.prism_coordinate
+        correlation = Q256.correlate_ints(root_coord, instance_coord)
+        return 1.0 - correlation['fidelity']
+
+
+def _profile_to_bytes(profile: list[float]) -> bytes:
+    """Encode normalized profile [0,1] as bytes for PRISM."""
+    # Scale to 0-255 per dimension, take first 32 bytes
+    encoded = bytearray(min(32, len(profile)))
+    for i in range(len(encoded)):
+        val = int(profile[i] * 255) if i < len(profile) else 0
+        encoded[i] = min(255, max(0, val))
+    return bytes(encoded)
+
+
+def _profile_to_int(profile: list[float]) -> int:
+    """Encode profile as integer for PRISM coordinate."""
+    encoded = _profile_to_bytes(profile)
+    return int.from_bytes(encoded, 'big')
+
+
+def _profile_to_prism_triplet(profile: list[float]) -> Triad:
+    """Convert profile to PRISM triadic coordinate."""
+    triplet = Q256._to_bytes(_profile_to_int(profile))
+    return Q256.triad(triplet)
+
+
+def _features_to_int(features: dict) -> int:
+    """Encode instance features as integer for PRISM coordinate."""
+    encoded = bytearray(32)
+    
+    if 'pos' in features and features['pos'] in _POS_IDX:
+        encoded[0] = _POS_IDX[features['pos']]
+    if 'verb_form' in features and features['verb_form'] in _VF_IDX:
+        encoded[1] = _VF_IDX[features['verb_form']]
+    if 'aspect' in features and features['aspect'] in _ASP_IDX:
+        encoded[2] = _ASP_IDX[features['aspect']]
+    if 'person' in features and features['person'] in _PER_IDX:
+        encoded[3] = _PER_IDX[features['person']]
+    if 'number' in features and features['number'] in _NUM_IDX:
+        encoded[4] = _NUM_IDX[features['number']]
+    if 'gender' in features and features['gender'] in _GEN_IDX:
+        encoded[5] = _GEN_IDX[features['gender']]
+    if 'case_value' in features and features['case_value'] in _CAS_IDX:
+        encoded[6] = _CAS_IDX[features['case_value']]
+    
+    return int.from_bytes(bytes(encoded), 'big')
 
 
 def build_root_vector(
     root_id: int,
     lookup_key: str,
-    label_ar: str | None,
+    label_ar: Optional[str],
     morpheme_features: list[dict],
-    instance_locations: list[tuple[int, int]],
+    instance_locations: list[tuple],
     cooccurrence_counts: dict[int, int] | None = None,
 ) -> RootVector:
-    """Build a RootVector from raw morpheme data.
-
-    Args:
-        root_id: feature ID of the root
-        lookup_key: e.g. "سجد"
-        label_ar: Arabic label
-        morpheme_features: list of dicts, one per morpheme type, with keys:
-            pos, verb_form, aspect, person, number, gender, case_value, lemma
-        instance_locations: list of (surah, ayah) for every word instance
-        cooccurrence_counts: dict of {other_root_id: count}
-    """
+    """Build a RootVector from raw morpheme data."""
     rv = RootVector(
         root_id=root_id,
         lookup_key=lookup_key,
@@ -166,7 +239,6 @@ def build_root_vector(
         cooccurrence_counts=cooccurrence_counts or {},
     )
 
-    # Count instances and spread
     rv.verse_locations = instance_locations
     verse_set = set(instance_locations)
     rv.total_instances = len(instance_locations)
@@ -176,59 +248,51 @@ def build_root_vector(
     rv.total_morpheme_types = len(morpheme_features)
 
     lemmas = set()
-    profile = np.zeros(PROFILE_DIM)
+    profile = [0.0] * PROFILE_DIM
 
     for mf in morpheme_features:
-        # POS
         pos = mf.get("pos")
         if pos and pos in _POS_IDX:
             profile[_POS_IDX[pos]] += 1
 
-        # Verb form
         vf = mf.get("verb_form")
         if vf and vf in _VF_IDX:
             profile[POS_DIM + _VF_IDX[vf]] += 1
 
-        # Aspect
         asp = mf.get("aspect")
         if asp and asp in _ASP_IDX:
             profile[POS_DIM + VF_DIM + _ASP_IDX[asp]] += 1
 
-        # Person
         per = mf.get("person")
         if per and per in _PER_IDX:
             offset = POS_DIM + VF_DIM + ASP_DIM
             profile[offset + _PER_IDX[per]] += 1
 
-        # Number
         num = mf.get("number")
         if num and num in _NUM_IDX:
             offset = POS_DIM + VF_DIM + ASP_DIM + PER_DIM
             profile[offset + _NUM_IDX[num]] += 1
 
-        # Gender
         gen = mf.get("gender")
         if gen and gen in _GEN_IDX:
             offset = POS_DIM + VF_DIM + ASP_DIM + PER_DIM + NUM_DIM
             profile[offset + _GEN_IDX[gen]] += 1
 
-        # Case
         cas = mf.get("case_value")
         if cas and cas in _CAS_IDX:
             offset = POS_DIM + VF_DIM + ASP_DIM + PER_DIM + NUM_DIM + GEN_DIM
             profile[offset + _CAS_IDX[cas]] += 1
 
-        # Lemma tracking
         lemma = mf.get("lemma")
         if lemma:
             lemmas.add(lemma)
 
     rv.total_lemmas = len(lemmas)
 
-    # Normalize profile to probability distribution
-    total = profile.sum()
+    # Normalize
+    total = sum(profile)
     if total > 0:
-        rv.profile = profile / total
+        rv.profile = [p / total for p in profile]
     else:
         rv.profile = profile
 
@@ -236,76 +300,48 @@ def build_root_vector(
 
 
 def instance_anomaly(root_vector: RootVector, instance_features: dict) -> float:
-    """How unusual is a specific instance relative to its root's typical behavior?
-
-    Returns a score in [0, 1]:
-      0 = this instance uses the most common form of this root (typical)
-      1 = this instance uses a form never seen for this root (maximally anomalous)
-
-    Computes anomaly per feature subspace (POS, verb_form, aspect, etc.)
-    independently, then averages across subspaces that have data.
-    This avoids the dilution problem of one big normalized vector.
-
-    A hapax legomenon root will have anomaly=0 for its only form
-    (it IS the distribution), but distributional_weight will be near 0.
-    """
-    if root_vector.total_morpheme_types <= 1:
-        return 0.0
-
-    # Define subspaces: (start_idx, dim, index_map, feature_key)
-    subspaces = [
-        (0, POS_DIM, _POS_IDX, "pos"),
-        (POS_DIM, VF_DIM, _VF_IDX, "verb_form"),
-        (POS_DIM + VF_DIM, ASP_DIM, _ASP_IDX, "aspect"),
-        (POS_DIM + VF_DIM + ASP_DIM, PER_DIM, _PER_IDX, "person"),
-        (POS_DIM + VF_DIM + ASP_DIM + PER_DIM, NUM_DIM, _NUM_IDX, "number"),
-        (POS_DIM + VF_DIM + ASP_DIM + PER_DIM + NUM_DIM, GEN_DIM, _GEN_IDX, "gender"),
-        (POS_DIM + VF_DIM + ASP_DIM + PER_DIM + NUM_DIM + GEN_DIM, CAS_DIM, _CAS_IDX, "case_value"),
-    ]
-
-    anomaly_scores = []
-    for start, dim, idx_map, feat_key in subspaces:
-        val = instance_features.get(feat_key)
-        if not val or val not in idx_map:
-            continue  # this subspace not active for this instance
-
-        # Get the sub-distribution for this feature space
-        sub_profile = root_vector.profile[start:start + dim]
-        sub_total = sub_profile.sum()
-        if sub_total == 0:
-            anomaly_scores.append(1.0)  # root never uses this subspace
-            continue
-
-        # Probability of this specific value within the subspace
-        prob = sub_profile[idx_map[val]] / sub_total
-        anomaly_scores.append(1.0 - prob)
-
-    if not anomaly_scores:
-        return 0.0
-
-    return float(np.mean(anomaly_scores))
+    """PRISM-native anomaly: fidelity deviation from root's typical behavior."""
+    instance_coord = _features_to_int(instance_features)
+    root_coord = _profile_to_int(root_vector.profile)
+    
+    correlation = Q256.correlate(root_coord, instance_coord)
+    return 1.0 - correlation['fidelity']
 
 
 def concordance_distance(rv_a: RootVector, rv_b: RootVector) -> float:
-    """Distance between two roots based on distributional overlap.
-
-    Uses Jensen-Shannon divergence on their profile vectors.
-    Returns value in [0, 1]: 0 = identical distributions, 1 = disjoint.
+    """PRISM correlation-based distance between roots.
+    
+    Uses PRISM fidelity: 1 = identical, 0 = maximally different.
+    Returns distance: 0 = identical, 1 = maximally different.
     """
-    p = rv_a.profile
-    q = rv_b.profile
+    coord_a = _profile_to_int(rv_a.profile)
+    coord_b = _profile_to_int(rv_b.profile)
+    
+    correlation = Q256.correlate(coord_a, coord_b)
+    return 1.0 - correlation['fidelity']
 
-    # Handle zero vectors
-    if p.sum() == 0 or q.sum() == 0:
-        return 1.0
 
-    # Jensen-Shannon divergence
-    m = 0.5 * (p + q)
+def root_correlation(rv_a: RootVector, rv_b: RootVector) -> dict:
+    """Full PRISM correlation between two roots."""
+    coord_a = _profile_to_int(rv_a.profile)
+    coord_b = _profile_to_int(rv_b.profile)
+    
+    return Q256.correlate(coord_a, coord_b)
 
-    # KL divergence with epsilon to avoid log(0)
-    eps = 1e-12
-    kl_pm = np.sum(p * np.log((p + eps) / (m + eps)))
-    kl_qm = np.sum(q * np.log((q + eps) / (m + eps)))
 
-    jsd = 0.5 * (kl_pm + kl_qm)
-    return float(np.clip(np.sqrt(jsd), 0.0, 1.0))  # sqrt for metric property
+def derive_concordance(rv_a: RootVector, rv_b: RootVector) -> dict:
+    """Create derivation certificate for concordance computation.
+    
+    Returns derivation with provenance for the distance computation.
+    """
+    term = Q256.make_term("xor", rv_a.prism_coordinate, rv_b.prism_coordinate)
+    derivation = Q256.derive(term)
+    
+    return {
+        'derivation': derivation,
+        'distance': concordance_distance(rv_a, rv_b),
+        'correlation': Q256.correlate(
+            _profile_to_int(rv_a.profile),
+            _profile_to_int(rv_b.profile)
+        )
+    }

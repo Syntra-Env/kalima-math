@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+src/geometer/__init__.py
+src/geometer/gauge.py
+src/geometer/prism.py
+src/geometer/root_space.py
+src/geometer/uor.py
+src/geometer/verse_dynamics.py
+src/geometer.egg-info/PKG-INFO
+src/geometer.egg-info/SOURCES.txt
+src/geometer.egg-info/dependency_links.txt
+src/geometer.egg-info/requires.txt
+src/geometer.egg-info/top_level.txt
