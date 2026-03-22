@@ -47,14 +47,10 @@ jobs:
         run: pytest conformance/tests/ -v --tb=short
 
       - name: Validate standards
-        run: |
-          python -c "
-            from conformance.standards import *
-            print('Standards loaded successfully')
-            print(f'Ring quantum: {RING_QUANTUM}')
-            print(f'Total profile dimension: {TOTAL_PROFILE_DIM}')
-            print(f'Lie algebra dimension: {LIE_ALGEBRA_DIMENSION}')
-          "
+        run: >
+          python -c "from conformance.standards import *; print('Standards loaded successfully');
+          print('Ring quantum:', RING_QUANTUM); print('Total profile dimension:', TOTAL_PROFILE_DIM);
+          print('Lie algebra dimension:', LIE_ALGEBRA_DIMENSION)"
 
       - name: Upload coverage
         uses: actions/upload-artifact@v4
